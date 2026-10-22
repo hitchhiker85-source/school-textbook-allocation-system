@@ -1,0 +1,62 @@
+name: Deploy Apps Script
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Type DEPLOY to update the existing production web app
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: textbook-apps-script-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main' && inputs.confirm == 'DEPLOY'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Validate configuration and write local clasp files
+        env:
+          CLASPRC_JSON: ${{ secrets.CLASPRC_JSON }}
+          SCRIPT_ID: ${{ vars.SCRIPT_ID }}
+          DEPLOYMENT_ID: ${{ vars.DEPLOYMENT_ID }}
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import path from 'node:path';
+
+          const required = ['CLASPRC_JSON', 'SCRIPT_ID', 'DEPLOYMENT_ID'];
+          const missing = required.filter((name) => !process.env[name]?.trim());
+          if (missing.length) throw new Error(`Missing protected deployment configuration: ${missing.join(', ')}`);
+          if (!fs.existsSync('appsscript.json')) throw new Error('Owner-verified appsscript.json is required before deployment.');
+          const manifest = JSON.parse(fs.readFileSync('appsscript.json', 'utf8'));
+          if (!manifest.timeZone || !manifest.runtimeVersion) throw new Error('Apps Script manifest is missing reviewed runtime settings.');
+          JSON.parse(process.env.CLASPRC_JSON);
+          const home = process.env.HOME;
+          fs.writeFileSync(path.join(home, '.clasprc.json'), process.env.CLASPRC_JSON, { mode: 0o600 });
+          fs.writeFileSync('.clasp.json', JSON.stringify({ scriptId: process.env.SCRIPT_ID, rootDir: '.' }), { mode: 0o600 });
+          NODE
+      - name: Verify files selected for Apps Script
+        run: npx --yes @google/clasp@3.4.1 show-file-status --json
+      - name: Push approved source
+        run: npx --yes @google/clasp@3.4.1 push
+      - name: Update the existing production deployment and create its version
+        env:
+          DEPLOYMENT_ID: ${{ vars.DEPLOYMENT_ID }}
+        run: |
+          npx --yes @google/clasp@3.4.1 update-deployment "$DEPLOYMENT_ID" --description "GitHub ${GITHUB_SHA:0:12}"

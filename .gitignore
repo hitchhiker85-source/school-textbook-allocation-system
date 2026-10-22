@@ -1,0 +1,28 @@
+# Apps Script local project and credentials
+.clasp.json
+.clasprc.json
+**/.clasp.json
+**/.clasprc.json
+*appsscript.local.json
+
+# School records and backups
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.ods
+*.sqlite
+*.db
+*.bak
+*.backup
+*learner-data*
+*student-data*
+*spreadsheet-export*
+
+# Local output
+node_modules/
+coverage/
+dist/
+.env
+.env.*
+!.env.example

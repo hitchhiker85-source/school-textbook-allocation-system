@@ -1,0 +1,12 @@
+{
+  "name": "school-textbook-allocation-system",
+  "version": "3.0.1",
+  "private": false,
+  "description": "Sanitized Apps Script source and checks for a school textbook allocation system.",
+  "scripts": {
+    "test": "node tests/run-tests.cjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,0 +1,423 @@
+<section id="records" class="view hidden" style="max-width:1360px;margin:0 auto;padding:22px">
+  <div class="panel">
+    <h2>Records Explorer</h2>
+    <p class="muted">Search and review learners, textbooks, assignments, invoice lines, payments, return credits, and audit events.</p>
+    <div class="row">
+      <div class="field"><label for="recordsSearch">Search records</label><input id="recordsSearch" placeholder="Learner, book code, title, invoice, payment, reference"></div>
+      <div class="field"><label for="recordsType">Record type</label><select id="recordsType"><option value="">All records</option><option>Learner</option><option>Textbook</option><option>Allocation</option><option>Invoice</option><option>Invoice line</option><option>Payment</option><option>Return credit</option><option>Audit event</option></select></div>
+      <div class="field"><label for="recordsGrade">Grade</label><select id="recordsGrade"><option value="">All grades</option></select></div>
+      <div class="field"><label for="recordsClass">Class</label><select id="recordsClass"><option value="">All classes</option></select></div>
+      <div class="field"><label for="recordsStatus">Status</label><select id="recordsStatus"><option value="">All statuses</option><option>Outstanding</option><option>Issued</option><option>Lost</option><option>Invoiced</option><option>Returned</option><option>Paid</option><option>Open</option><option>Part-paid</option><option>Credited</option></select></div>
+      <div class="field"><label for="recordsFrom">From date</label><input id="recordsFrom" type="date"></div>
+      <div class="field"><label for="recordsTo">To date</label><input id="recordsTo" type="date"></div>
+      <div class="field"><label for="recordsSort">Sort by</label><select id="recordsSort"><option value="date">Date</option><option value="type">Record type</option><option value="learner">Learner</option><option value="bookId">Book code</option><option value="amount">Amount</option><option value="status">Status</option></select></div>
+      <div class="field"><label for="recordsDirection">Sort direction</label><select id="recordsDirection"><option value="desc">Descending</option><option value="asc">Ascending</option></select></div>
+      <div class="field"><label for="recordsPageSize">Rows per page</label><select id="recordsPageSize"><option>25</option><option>50</option><option>100</option></select></div>
+    </div>
+    <div class="actions"><button id="recordsExport" class="primary">Export all filtered rows to CSV</button><span id="recordsCount" class="muted"></span></div>
+    <div id="recordsTable"></div>
+    <div class="actions"><button id="recordsPrevious">Previous</button><span id="recordsPageLabel" class="muted"></span><button id="recordsNext">Next</button></div>
+  </div>
+  <div id="bookHistoryDetail"></div>
+</section>
+<script>
+let v3RecordsPage = 0;
+let v3RecordsFiltered = [];
+let v3RecordsListenersReady = false;
+
+function lineBalance(invoice, bookId) {
+  return lineLedger(invoice, bookId, db.payments || [], db.adjustments || []);
+}
+
+function invoiceBalance(invoice) {
+  return invoiceLedger(invoice, db.payments || [], db.adjustments || []);
+}
+
+function applySharedSnapshot(state) {
+  db = {
+    ...db,
+    learners: (state.learners || []).map(item => ({ ...item, class: item.className || item.class || '' })),
+    books: [], allocations: state.allocations || [], subjectChoices: state.subjectChoices || [],
+    invoices: state.invoices || [], payments: state.payments || [], adjustments: state.adjustments || [],
+    audit: state.audit || [], seq: { ...db.seq, ...(state.seq || {}) },
+  };
+  textbookCatalogue = state.catalogue || [];
+}
+
+function recordBookReturn(no, id, note) {
+  const a = allocation(no, id);
+  if (!a || a.status === 'Returned' || a.status === 'Paid') return false;
+  const invoice = a.invoiceNo && db.invoices.find(item => item.invoiceNo === a.invoiceNo);
+  let credit = null;
+  if (invoice && invoice.items.some(item => String(item.bookId) === String(id))) {
+    const balance = lineBalance(invoice, id);
+    if (balance.due > 0) credit = returnCredit(invoice, id, db.payments, db.adjustments || []);
+  }
+  const previous = a.status;
+  a.status = 'Returned'; a.returnedAt = now(); a.returnNote = note || '';
+  if (credit) {
+    credit.adjustmentId = idgen('ADJ', db.seq.adjustment++);
+    credit.allocationId = a.allocationId;
+    credit.createdAt = now();
+    credit.reference = 'RETURN-' + credit.adjustmentId;
+    db.adjustments.unshift(credit);
+    log('INVOICE_RETURN_CREDIT', no, id, previous, 'Returned / credited', credit.reference, 'Credited remaining book balance ' + money(credit.amount));
+  }
+  log('BOOK_RETURNED', no, id, previous, 'Returned', credit ? credit.reference : '', note || 'Book returned through normal collection handling');
+  return true;
+}
+
+function markReturned(en, eb) {
+  const no = decodeURIComponent(en), id = decodeURIComponent(eb), a = allocation(no, id);
+  if (!a || a.status === 'Returned') return alert('This allocation is already returned or cannot be found.');
+  if (a.status === 'Paid') return alert('This book has been paid for as lost. Correct the payment record before recording a return.');
+  if (!confirm(`Record ${bookTitle(id)} (${id}) as returned by ${learnerName(no)}?`)) return;
+  recordBookReturn(no, id, 'Book returned through normal collection handling');
+  save();
+  if (typeof collectionLearner === 'function') collectionLearner(en);
+  if (selectedLearner) showLearner(encodeURIComponent(selectedLearner));
+  if (selectedInvoice) viewInvoice(encodeURIComponent(selectedInvoice));
+}
+
+function createInvoiceFor(no, ids) {
+  const candidates = invoiceChargeCandidates(db.allocations).filter(item => key(item.learnerNumber) === key(no));
+  const chosen = new Set((ids || []).map(String));
+  const selected = candidates.filter(item => chosen.has(String(item.bookId)));
+  if (!selected.length) return alert('Select one or more reported-lost books that have not already been invoiced. Books still with the learner are listed but are not chargeable until reported lost.');
+  const items = selected.map(item => ({
+    bookId: item.bookId, title: bookTitle(item.bookId), amount: Number(book(item.bookId)?.replacementPrice || item.price || 0),
+  }));
+  if (items.some(item => !Number.isFinite(item.amount) || item.amount <= 0)) return alert('Every selected lost book must have a valid replacement price.');
+  const total = items.reduce((sum, item) => sum + item.amount, 0);
+  if (!confirm(`Create an invoice for ${items.length} reported-lost book(s), total ${money(total)}? Books still with the learner will not be charged.`)) return;
+
+  let invoiceNo;
+  do { invoiceNo = idgen('INV', db.seq.invoice++); } while (db.invoices.some(item => item.invoiceNo === invoiceNo));
+  const invoice = { invoiceNo, learnerNumber: no, createdAt: now(), items, total, notes: 'Selected reported-lost books' };
+  db.invoices.unshift(invoice);
+  selected.forEach(item => {
+    const previous = item.status;
+    item.lostAt = item.lostAt || now(); item.status = 'Invoiced'; item.invoiceNo = invoiceNo;
+    log('BOOK_INVOICED', no, item.bookId, previous, 'Invoiced', invoiceNo, 'Replacement charge for a reported-lost book');
+  });
+  log('INVOICE_CREATED', no, '', '', 'Total ' + total, invoiceNo, 'Selected ' + items.length + ' lost book(s)');
+  save();
+  if (managedLearnerNo) showLearner(encodeURIComponent(managedLearnerNo));
+  else { switchTab('invoices'); $('invoiceSearch').value = invoiceNo; renderInvoices(); viewInvoice(encodeURIComponent(invoiceNo)); }
+}
+
+function invoiceFor(en) {
+  const no = decodeURIComponent(en);
+  const eligible = invoiceChargeCandidates(db.allocations).filter(item => key(item.learnerNumber) === key(no));
+  if (!eligible.length) return alert('There are no unbilled reported-lost books for this learner. Books still held can be returned or reported lost first.');
+  openSelectModal('Invoice reported-lost books', `Choose only the reported-lost books to charge for ${learnerName(no)}. Still-held books remain visible on the learner statement and are not charged.`, eligible.map(item => ({
+    id: item.bookId, label: `${bookTitle(item.bookId)} (${item.bookId}) — ${money(book(item.bookId)?.replacementPrice || item.price || 0)}`,
+  })), ids => createInvoiceFor(no, ids));
+}
+
+function bulkInvoiceGroups(allocations) {
+  const groups = new Map();
+  invoiceChargeCandidates(allocations).forEach(item => {
+    const no = String(item.learnerNumber);
+    if (!groups.has(no)) groups.set(no, []);
+    groups.get(no).push(item);
+  });
+  return [...groups].map(([learnerNumber, items]) => ({ learnerNumber, allocations: items }));
+}
+
+function createBulkInvoices() {
+  const groups = bulkInvoiceGroups(db.allocations).filter(group => learner(group.learnerNumber));
+  if (!groups.length) { $('bulkInvoiceResult').innerHTML = '<div class="notice">No unbilled reported-lost books need an invoice.</div>'; return; }
+  const count = groups.reduce((sum, group) => sum + group.allocations.length, 0);
+  const total = groups.reduce((sum, group) => sum + group.allocations.reduce((sub, item) => sub + Number(book(item.bookId)?.replacementPrice || item.price || 0), 0), 0);
+  if (!confirm(`Create ${groups.length} invoice(s) for ${count} reported-lost book(s), total ${money(total)}? Still-held books will not be charged.`)) return;
+  groups.forEach(group => {
+    let invoiceNo;
+    do { invoiceNo = idgen('INV', db.seq.invoice++); } while (db.invoices.some(item => item.invoiceNo === invoiceNo));
+    const items = group.allocations.map(item => ({ bookId: item.bookId, title: bookTitle(item.bookId), amount: Number(book(item.bookId)?.replacementPrice || item.price || 0) }));
+    const invoiceTotal = items.reduce((sum, item) => sum + item.amount, 0);
+    db.invoices.unshift({ invoiceNo, learnerNumber: group.learnerNumber, createdAt: now(), items, total: invoiceTotal, notes: 'Bulk invoice for reported-lost books' });
+    group.allocations.forEach(item => {
+      const previous = item.status;
+      item.lostAt = item.lostAt || now(); item.status = 'Invoiced'; item.invoiceNo = invoiceNo;
+      log('BOOK_INVOICED', group.learnerNumber, item.bookId, previous, 'Invoiced', invoiceNo, 'Bulk replacement charge for a reported-lost book');
+    });
+    log('INVOICE_CREATED', group.learnerNumber, '', '', 'Total ' + invoiceTotal, invoiceNo, 'Bulk invoice for ' + items.length + ' lost book(s)');
+  });
+  save(); renderInvoices();
+  $('bulkInvoiceResult').innerHTML = `<div class="notice ok">Created ${groups.length} invoice(s) for ${count} reported-lost book(s), totaling ${money(total)}.</div>`;
+}
+
+function recordPaymentForBook(encodedInvoiceNo, encodedBookId) {
+  const invoiceNo = decodeURIComponent(encodedInvoiceNo), bookId = decodeURIComponent(encodedBookId);
+  const invoice = db.invoices.find(item => item.invoiceNo === invoiceNo);
+  if (!invoice) return alert('Invoice not found. Refresh the shared data and try again.');
+  const line = invoice.items.find(item => String(item.bookId) === String(bookId));
+  if (!line) return alert('This book code is not on the selected invoice.');
+  const current = lineBalance(invoice, bookId);
+  if (current.due <= 0) return alert('This book has no amount due.');
+  $('modalRoot').innerHTML = `<div class="modal"><div class="modalbox"><button class="close" onclick="closeModal()">Close</button><h2>Record payment for ${esc(bookTitle(bookId))}</h2><p><b>Book code:</b> ${esc(bookId)}<br><b>Invoice:</b> ${esc(invoiceNo)}<br><b>Remaining amount:</b> ${money(current.due)}</p><div class="field"><label for="v3PayAmount">Payment amount (ZAR)</label><input id="v3PayAmount" type="number" min="0.01" step="0.01" value="${current.due.toFixed(2)}"></div><div class="field"><label for="v3PayMethod">Payment method</label><select id="v3PayMethod"><option>Cash</option><option>EFT</option><option>Card</option><option>Other</option></select></div><div class="field"><label for="v3PayReference">Receipt / reference</label><input id="v3PayReference"></div><div class="actions"><button class="primary" id="v3SavePayment">Save payment for ${esc(bookId)}</button><button onclick="closeModal()">Cancel</button></div></div></div>`;
+  $('v3SavePayment').onclick = () => {
+    const amount = Number($('v3PayAmount').value);
+    if (!Number.isFinite(amount) || amount <= 0) return alert('Enter a valid positive payment amount.');
+    if (amount - current.due > 0.001) return alert('Payment cannot exceed the remaining amount for this book.');
+    const paymentNo = idgen('PAY', db.seq.payment++);
+    const payment = { paymentNo, invoiceNo, learnerNumber: invoice.learnerNumber, bookId, amount, method: $('v3PayMethod').value, reference: $('v3PayReference').value.trim(), createdAt: now() };
+    db.payments.unshift(payment);
+    const allocationRecord = allocation(invoice.learnerNumber, bookId);
+    const next = lineBalance(invoice, bookId);
+    if (allocationRecord && next.due <= 0 && next.state === 'Paid' && allocationRecord.status !== 'Paid') {
+      const previous = allocationRecord.status;
+      allocationRecord.status = 'Paid'; allocationRecord.paidAt = payment.createdAt; allocationRecord.paymentNo = paymentNo;
+      log('BOOK_PAID', invoice.learnerNumber, bookId, previous, 'Paid', paymentNo, 'Lost book replacement charge paid; removed from active inventory');
+    }
+    log('PAYMENT_RECORDED', invoice.learnerNumber, bookId, '', String(amount), paymentNo, `Invoice ${invoiceNo}; method ${payment.method}; ${payment.reference}`);
+    save(); closeModal(); viewInvoice(encodeURIComponent(invoiceNo)); renderInvoices();
+  };
+}
+
+function paySingle(en, eb) {
+  recordPaymentForBook(encodeURIComponent(decodeURIComponent(en)), encodeURIComponent(decodeURIComponent(eb)));
+}
+
+function invoiceLineRows(invoice) {
+  return invoice.items.map(item => {
+    const balance = lineBalance(invoice, item.bookId);
+    const allocationRecord = allocation(invoice.learnerNumber, item.bookId);
+    const controls = [];
+    if (balance.due > 0) controls.push(`<button class="small primary" onclick="recordPaymentForBook('${encodeURIComponent(invoice.invoiceNo)}','${encodeURIComponent(item.bookId)}')">Record payment</button>`);
+    if (allocationRecord && !['Returned', 'Paid'].includes(allocationRecord.status)) controls.push(`<button class="small" onclick="markReturned('${encodeURIComponent(invoice.learnerNumber)}','${encodeURIComponent(item.bookId)}')">Process return</button>`);
+    return `<tr><td>${esc(item.bookId)}</td><td>${esc(item.title || bookTitle(item.bookId))}</td><td class="money">${money(balance.charged)}</td><td class="money">${money(balance.paid)}</td><td class="money">${money(balance.credited)}</td><td class="money">${money(balance.due)}</td><td>${statusBadge(balance.state)}</td><td><div class="actions">${controls.join(' ') || '—'}</div></td></tr>`;
+  });
+}
+
+function viewInvoice(en) {
+  const invoiceNo = decodeURIComponent(en), invoice = db.invoices.find(item => item.invoiceNo === invoiceNo);
+  if (!invoice) return;
+  selectedInvoice = invoiceNo;
+  const summary = invoiceBalance(invoice);
+  const learnerAllocations = db.allocations.filter(item => key(item.learnerNumber) === key(invoice.learnerNumber));
+  const held = learnerBookSections(learnerAllocations).held;
+  const payments = db.payments.filter(item => item.invoiceNo === invoiceNo);
+  const credits = (db.adjustments || []).filter(item => item.invoiceNo === invoiceNo);
+  const statusText = summary.status === 'Open' && summary.paid > 0 ? 'Open · part-paid' : summary.status;
+  $('invoiceDetail').innerHTML = `<div class="panel" id="invoicePrintable"><div class="actions noprint"><button onclick="printInvoice('${encodeURIComponent(invoiceNo)}')">Print invoice</button></div><h2>Invoice ${esc(invoiceNo)}</h2><p><b>Learner:</b> ${esc(learnerName(invoice.learnerNumber))} (${esc(invoice.learnerNumber)})<br><b>Grade / class:</b> ${esc(learner(invoice.learnerNumber)?.grade || '—')} / ${esc(learner(invoice.learnerNumber)?.className || '—')}<br><b>Date:</b> ${esc((invoice.createdAt || '').replace('T', ' ').slice(0, 16))}<br><b>Status:</b> ${statusBadge(statusText)}</p><h3>Reported-lost books charged</h3>${table(['Book code', 'Textbook', 'Charge', 'Paid', 'Credit', 'Amount due', 'Line status', 'Actions'], invoiceLineRows(invoice))}<p><b>Charges:</b> ${money(summary.charged)} · <b>Payments:</b> ${money(summary.paid)} · <b>Credits:</b> ${money(summary.credited)} · <b>Amount due:</b> ${money(summary.due)}</p><h3>Still with learner · not charged</h3><p class="muted">These books remain listed so staff can process returns. A replacement charge is created only after a book is reported lost.</p>${table(['Book code', 'Textbook', 'Status', 'Action'], held.map(item => `<tr><td>${esc(item.bookId)}</td><td>${esc(bookTitle(item.bookId))}</td><td>${statusBadge(item.status)}</td><td><button class="small" onclick="markReturned('${encodeURIComponent(invoice.learnerNumber)}','${encodeURIComponent(item.bookId)}')">Process return</button></td></tr>`))}<h3>Payment history</h3>${table(['Payment', 'Date', 'Book code', 'Amount', 'Method', 'Reference'], payments.map(payment => `<tr><td>${esc(payment.paymentNo)}</td><td>${esc((payment.createdAt || '').slice(0, 16).replace('T', ' '))}</td><td>${esc(payment.bookId)}</td><td class="money">${money(payment.amount)}</td><td>${esc(payment.method)}</td><td>${esc(payment.reference)}</td></tr>`))}<h3>Return credit history</h3>${table(['Adjustment', 'Date', 'Book code', 'Amount', 'Reference'], credits.map(item => `<tr><td>${esc(item.adjustmentId)}</td><td>${esc((item.createdAt || '').slice(0, 16).replace('T', ' '))}</td><td>${esc(item.bookId)}</td><td class="money">${money(item.amount)}</td><td>${esc(item.reference)}</td></tr>`))}</div>`;
+}
+
+function renderInvoices() {
+  populateGradeClassFilters('invoiceGradeFilter', 'invoiceClassFilter');
+  const query = key($('invoiceSearch').value), grade = key($('invoiceGradeFilter').value), className = key($('invoiceClassFilter').value);
+  const invoices = db.invoices.filter(invoice => {
+    const person = learner(invoice.learnerNumber), summary = invoiceBalance(invoice);
+    return (!grade || key(person?.grade) === grade) && (!className || key(person?.className) === className) &&
+      (!query || [invoice.invoiceNo, invoice.learnerNumber, learnerName(invoice.learnerNumber), ...invoice.items.map(item => item.bookId)].some(value => key(value).includes(query))) ;
+  });
+  $('invoiceTable').innerHTML = table(['Invoice', 'Date', 'Learner', 'Books', 'Charges', 'Paid', 'Credits', 'Due', 'Status', 'Action'], invoices.map(invoice => {
+    const summary = invoiceBalance(invoice), statusText = summary.status === 'Open' && summary.paid > 0 ? 'Open · part-paid' : summary.status;
+    return `<tr><td>${esc(invoice.invoiceNo)}</td><td>${esc((invoice.createdAt || '').slice(0, 10))}</td><td>${esc(learnerName(invoice.learnerNumber))} (${esc(invoice.learnerNumber)})</td><td>${invoice.items.length}</td><td class="money">${money(summary.charged)}</td><td class="money">${money(summary.paid)}</td><td class="money">${money(summary.credited)}</td><td class="money">${money(summary.due)}</td><td>${statusBadge(statusText)}</td><td><button class="small" onclick="viewInvoice('${encodeURIComponent(invoice.invoiceNo)}')">Open</button> <button class="small" onclick="printSingleInvoicePage('${encodeURIComponent(invoice.invoiceNo)}')">Print</button></td></tr>`;
+  }));
+}
+
+function invoicePrintMarkup(invoices) {
+  return invoices.map(invoice => {
+    const person = learner(invoice.learnerNumber) || {}, summary = invoiceBalance(invoice);
+    const lines = invoice.items.map(item => `<tr><td>${esc(item.title || bookTitle(item.bookId))}</td><td>${esc(item.bookId)}</td><td class="money">${money(item.amount)}</td><td class="money">${money(lineBalance(invoice, item.bookId).due)}</td></tr>`).join('');
+    const held = learnerBookSections(db.allocations.filter(item => key(item.learnerNumber) === key(invoice.learnerNumber))).held;
+    const heldRows = held.map(item => `<tr><td>${esc(bookTitle(item.bookId))}</td><td>${esc(item.bookId)}</td><td>${esc(item.status)}</td><td>No replacement charge</td></tr>`).join('');
+    return `<section class="invoicePrintPage"><h1>Textbook Invoice</h1><p><b>Invoice:</b> ${esc(invoice.invoiceNo)} &nbsp; <b>Date:</b> ${esc((invoice.createdAt || '').slice(0, 10))}</p><p><b>Learner:</b> ${esc(learnerName(invoice.learnerNumber))} (${esc(invoice.learnerNumber)})<br><b>Grade / Class:</b> ${esc(person.grade || '—')} / ${esc(person.className || '—')}</p><h2>Reported-lost books charged</h2><table><thead><tr><th>Textbook</th><th>Book code</th><th>Charge</th><th>Amount due</th></tr></thead><tbody>${lines}</tbody></table><h2>Books still with learner · not charged</h2><table><thead><tr><th>Textbook</th><th>Book code</th><th>Status</th><th>Charge status</th></tr></thead><tbody>${heldRows || '<tr><td colspan="4">No other books are currently held.</td></tr>'}</tbody></table><p><b>Charges:</b> ${money(summary.charged)}<br><b>Payments:</b> ${money(summary.paid)}<br><b>Return credits:</b> ${money(summary.credited)}<br><b>Amount due:</b> ${money(summary.due)}<br><b>Status:</b> ${esc(summary.status)}</p></section>`;
+  }).join('');
+}
+
+function wordInvoiceDocument() {
+  const pages = db.invoices.map(invoice => invoicePrintMarkup([invoice])).join('');
+  return '<!doctype html><html><head><meta charset="utf-8"><title>Textbook invoices</title></head><body>' + pages + '</body></html>';
+}
+
+function showLearner(encoded) {
+  const no = decodeURIComponent(encoded), person = learner(no);
+  if (!person || (managedLearnerNo && key(no) !== key(managedLearnerNo))) return;
+  selectedLearner = no;
+  const allocations = db.allocations.filter(item => key(item.learnerNumber) === key(no));
+  const sections = learnerBookSections(allocations);
+  const invoices = db.invoices.filter(item => key(item.learnerNumber) === key(no));
+  const bookRows = (items, category) => items.map(item => {
+    const actions = [];
+    if (category === 'held') {
+      actions.push(`<button class="small" onclick="markReturned('${encodeURIComponent(no)}','${encodeURIComponent(item.bookId)}')">Return</button>`);
+      if (!['Invoiced'].includes(item.status)) actions.push(`<button class="small" onclick="markLost('${encodeURIComponent(no)}','${encodeURIComponent(item.bookId)}')">Report lost</button>`);
+    } else if (category === 'lost') {
+      if (item.status === 'Lost' && !item.invoiceNo) actions.push(`<button class="small" onclick="invoiceSingle('${encodeURIComponent(no)}','${encodeURIComponent(item.bookId)}')">Invoice book</button>`);
+      if (item.invoiceNo) actions.push(`<button class="small" onclick="openLearnerInvoice('${encodeURIComponent(item.invoiceNo)}')">Open invoice</button>`);
+      actions.push(`<button class="small" onclick="markReturned('${encodeURIComponent(no)}','${encodeURIComponent(item.bookId)}')">Process return</button>`);
+    }
+    return `<tr><td><button class="small" onclick="openBookHistory('${encodeURIComponent(item.bookId)}')">${esc(item.bookId)}</button></td><td>${esc(bookTitle(item.bookId))}</td><td class="money">${money(book(item.bookId)?.replacementPrice || item.price || 0)}</td><td>${statusBadge(item.status)}</td><td><div class="actions">${actions.join(' ') || '—'}</div></td></tr>`;
+  });
+  const invoiceRows = invoices.map(invoice => {
+    const summary = invoiceBalance(invoice), statusText = summary.status === 'Open' && summary.paid > 0 ? 'Open · part-paid' : summary.status;
+    return `<tr><td>${esc(invoice.invoiceNo)}</td><td>${esc((invoice.createdAt || '').slice(0, 10))}</td><td class="money">${money(summary.charged)}</td><td class="money">${money(summary.paid)}</td><td class="money">${money(summary.credited)}</td><td class="money">${money(summary.due)}</td><td>${statusBadge(statusText)}</td><td><button class="small" onclick="openLearnerInvoice('${encodeURIComponent(invoice.invoiceNo)}')">Open</button> <button class="small" onclick="printSingleInvoicePage('${encodeURIComponent(invoice.invoiceNo)}')">Print</button></td></tr>`;
+  });
+  const assignButton = managedLearnerNo ? '<button onclick="assignCatalogueBooksToManagedLearner()">Assign catalogue books</button>' : '';
+  $('learnerDetail').innerHTML = `<div class="panel"><div class="actions noprint">${assignButton}<button onclick="openCollectionFor('${encodeURIComponent(no)}')">Collect / return books</button><button class="primary" onclick="invoiceFor('${encodeURIComponent(no)}')">Invoice selected lost books</button><button onclick="printLearner('${encodeURIComponent(no)}')">Print learner statement</button><button onclick="openRecordsForLearner('${encodeURIComponent(no)}')">Explore learner records</button></div>${managedLearnerNo ? '<div class="notice">Learner-only view. Actions apply only to this learner.</div>' : ''}<h2>${esc(learnerName(no))} <span class="muted">(${esc(no)})</span></h2><p>Grade ${esc(person.grade || '—')} · Class ${esc(person.className || '—')}</p><h3>Still with learner · not charged</h3>${table(['Book code', 'Textbook', 'Replacement value', 'Status', 'Actions'], bookRows(sections.held, 'held'))}<h3>Reported lost</h3>${table(['Book code', 'Textbook', 'Replacement value', 'Status', 'Actions'], bookRows(sections.lost, 'lost'))}<h3>Returned books</h3>${table(['Book code', 'Textbook', 'Replacement value', 'Status'], bookRows(sections.returned, 'none'))}<h3>Paid lost books · history</h3>${table(['Book code', 'Textbook', 'Replacement value', 'Status'], bookRows(sections.paidLost, 'none'))}<h3>Invoices</h3>${table(['Invoice', 'Date', 'Charges', 'Paid', 'Credits', 'Due', 'Status', 'Actions'], invoiceRows)}</div>`;
+}
+
+function recordRows() {
+  const rows = [];
+  db.learners.forEach(item => rows.push({ type: 'Learner', date: '', learner: learnerName(item.learnerNumber), learnerNumber: item.learnerNumber, grade: item.grade || '', className: item.className || '', bookId: '', invoiceNo: '', status: 'Active', amount: '', reference: item.learnerNumber, details: `${item.firstName || ''} ${item.surname || ''}`.trim() }));
+  textbookCatalogue.forEach(item => rows.push({ type: 'Textbook', date: '', learner: '', learnerNumber: '', grade: item.Grade || '', className: '', bookId: item.BookID || '', invoiceNo: '', status: 'Catalogue', amount: Number(item.OriginalPrice_ZAR || 0), reference: item.ISBN || '', details: `${item.Title || ''} · ${item.Subject || ''}` }));
+  db.allocations.forEach(item => {
+    const person = learner(item.learnerNumber) || {};
+    rows.push({ type: 'Allocation', date: item.returnedAt || item.lostAt || item.allocationDate || '', learner: learnerName(item.learnerNumber), learnerNumber: item.learnerNumber, grade: person.grade || '', className: person.className || '', bookId: item.bookId, invoiceNo: item.invoiceNo || '', status: item.status || 'Outstanding', amount: Number(item.price || 0), reference: item.allocationId, details: bookTitle(item.bookId) });
+  });
+  db.invoices.forEach(invoice => {
+    const person = learner(invoice.learnerNumber) || {}, summary = invoiceBalance(invoice);
+    rows.push({ type: 'Invoice', date: invoice.createdAt || '', learner: learnerName(invoice.learnerNumber), learnerNumber: invoice.learnerNumber, grade: person.grade || '', className: person.className || '', bookId: '', invoiceNo: invoice.invoiceNo, status: summary.status, amount: summary.due, reference: invoice.invoiceNo, details: `${invoice.items.length} book lines · ${money(summary.due)} due` });
+    invoice.items.forEach(item => {
+      const balance = lineBalance(invoice, item.bookId);
+      rows.push({ type: 'Invoice line', date: invoice.createdAt || '', learner: learnerName(invoice.learnerNumber), learnerNumber: invoice.learnerNumber, grade: person.grade || '', className: person.className || '', bookId: item.bookId, invoiceNo: invoice.invoiceNo, status: balance.state, amount: balance.due, reference: invoice.invoiceNo, details: `${item.title || bookTitle(item.bookId)} · ${money(balance.charged)} charged` });
+    });
+  });
+  db.payments.forEach(item => {
+    const person = learner(item.learnerNumber) || {};
+    rows.push({ type: 'Payment', date: item.createdAt || '', learner: learnerName(item.learnerNumber), learnerNumber: item.learnerNumber, grade: person.grade || '', className: person.className || '', bookId: item.bookId || '', invoiceNo: item.invoiceNo || '', status: 'Recorded', amount: Number(item.amount || 0), reference: item.reference || item.paymentNo, details: `${item.method || ''} ${item.paymentNo || ''}`.trim() });
+  });
+  (db.adjustments || []).forEach(item => {
+    const person = learner(item.learnerNumber) || {};
+    rows.push({ type: 'Return credit', date: item.createdAt || '', learner: learnerName(item.learnerNumber), learnerNumber: item.learnerNumber, grade: person.grade || '', className: person.className || '', bookId: item.bookId || '', invoiceNo: item.invoiceNo || '', status: 'Credited', amount: Number(item.amount || 0), reference: item.reference || item.adjustmentId, details: `${item.type || ''} ${item.adjustmentId || ''}`.trim() });
+  });
+  db.audit.forEach(item => {
+    const person = learner(item.learnerNo || item.learnerNumber) || {};
+    rows.push({ type: 'Audit event', date: item.timestamp || '', learner: learnerName(item.learnerNo || item.learnerNumber), learnerNumber: item.learnerNo || item.learnerNumber || '', grade: person.grade || '', className: person.className || '', bookId: item.bookId || '', invoiceNo: '', status: item.action || '', amount: '', reference: item.reference || '', details: item.notes || `${item.previousState || ''} → ${item.newState || ''}` });
+  });
+  return rows;
+}
+
+function filteredRecordRows() {
+  const query = key($('recordsSearch').value), type = $('recordsType').value, grade = key($('recordsGrade').value), className = key($('recordsClass').value), status = key($('recordsStatus').value);
+  const from = $('recordsFrom').value, to = $('recordsTo').value;
+  const sort = $('recordsSort').value, direction = $('recordsDirection').value === 'asc' ? 1 : -1;
+  const rows = recordRows().filter(row => {
+    const haystack = Object.values(row).join(' ').toLowerCase();
+    const day = String(row.date || '').slice(0, 10);
+    return (!query || haystack.includes(query)) && (!type || row.type === type) && (!grade || key(row.grade) === grade) && (!className || key(row.className) === className) && (!status || key(row.status).includes(status)) && (!from || (day && day >= from)) && (!to || (day && day <= to));
+  });
+  rows.sort((left, right) => {
+    const a = left[sort] ?? '', b = right[sort] ?? '';
+    const compare = sort === 'amount' ? Number(a || 0) - Number(b || 0) : String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: 'base' });
+    return compare * direction || String(left.type).localeCompare(String(right.type));
+  });
+  return rows;
+}
+
+function renderRecordsExplorer() {
+  if (!$('recordsTable')) return;
+  const gradeSelect = $('recordsGrade'), classSelect = $('recordsClass');
+  const keepGrade = gradeSelect.value, keepClass = classSelect.value;
+  gradeSelect.innerHTML = '<option value="">All grades</option>' + availableGrades().map(value => `<option value="${esc(value)}">Grade ${esc(value)}</option>`).join('');
+  const classes = [...new Set(db.learners.map(item => String(item.className || '')).filter(Boolean))].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  classSelect.innerHTML = '<option value="">All classes</option>' + classes.map(value => `<option value="${esc(value)}">${esc(value)}</option>`).join('');
+  gradeSelect.value = keepGrade; classSelect.value = keepClass;
+  v3RecordsFiltered = filteredRecordRows();
+  const size = Number($('recordsPageSize').value) || 25, pages = Math.max(1, Math.ceil(v3RecordsFiltered.length / size));
+  v3RecordsPage = Math.min(v3RecordsPage, pages - 1);
+  const start = v3RecordsPage * size, visible = v3RecordsFiltered.slice(start, start + size);
+  $('recordsCount').textContent = `${v3RecordsFiltered.length} matching record(s)`;
+  $('recordsPageLabel').textContent = `Page ${v3RecordsPage + 1} of ${pages}`;
+  $('recordsPrevious').disabled = v3RecordsPage <= 0; $('recordsNext').disabled = v3RecordsPage >= pages - 1;
+  $('recordsTable').innerHTML = table(['Type', 'Date', 'Learner', 'Grade / class', 'Book code', 'Invoice', 'Status', 'Amount', 'Reference', 'Details'], visible.map(row => {
+    const bookLink = row.bookId ? `<button class="small" onclick="openBookHistory('${encodeURIComponent(row.bookId)}')">${esc(row.bookId)}</button>` : '';
+    const learnerLink = row.learnerNumber ? `<button class="small" onclick="openLearnerFromRecords('${encodeURIComponent(row.learnerNumber)}')">${esc(row.learner)}</button>` : esc(row.learner);
+    const invoiceLink = row.invoiceNo ? `<button class="small" onclick="openInvoiceFromRecords('${encodeURIComponent(row.invoiceNo)}')">${esc(row.invoiceNo)}</button>` : '';
+    return `<tr><td>${esc(row.type)}</td><td>${esc(String(row.date || '').replace('T', ' ').slice(0, 16))}</td><td>${learnerLink}</td><td>${esc([row.grade, row.className].filter(Boolean).join(' / '))}</td><td>${bookLink}</td><td>${invoiceLink}</td><td>${statusBadge(row.status)}</td><td class="money">${row.amount === '' ? '' : money(row.amount)}</td><td>${esc(row.reference)}</td><td>${esc(row.details)}</td></tr>`;
+  }));
+}
+
+function openLearnerFromRecords(encoded) {
+  const no = decodeURIComponent(encoded);
+  switchTab('learners'); showLearner(encodeURIComponent(no));
+}
+
+function openInvoiceFromRecords(encoded) {
+  const invoiceNo = decodeURIComponent(encoded);
+  switchTab('invoices'); $('invoiceSearch').value = invoiceNo; renderInvoices(); viewInvoice(encodeURIComponent(invoiceNo));
+}
+
+function openRecordsForLearner(encoded) {
+  const no = decodeURIComponent(encoded);
+  switchTab('records'); $('recordsSearch').value = no; v3RecordsPage = 0; renderRecordsExplorer();
+}
+
+function openBookHistory(encoded) {
+  const bookId = decodeURIComponent(encoded), catalogue = book(bookId) || {};
+  const history = [];
+  db.allocations.filter(item => key(item.bookId) === key(bookId)).forEach(item => {
+    const person = learner(item.learnerNumber) || {};
+    history.push({ date: item.allocationDate || '', event: 'Allocated', learner: learnerName(item.learnerNumber), learnerNo: item.learnerNumber, invoiceNo: item.invoiceNo || '', amount: item.price || 0, reference: item.allocationId });
+    if (item.lostAt) history.push({ date: item.lostAt, event: 'Reported lost', learner: learnerName(item.learnerNumber), learnerNo: item.learnerNumber, invoiceNo: item.invoiceNo || '', amount: '', reference: item.allocationId });
+    if (item.returnedAt) history.push({ date: item.returnedAt, event: 'Returned', learner: learnerName(item.learnerNumber), learnerNo: item.learnerNumber, invoiceNo: item.invoiceNo || '', amount: '', reference: item.allocationId });
+    if (item.paidAt) history.push({ date: item.paidAt, event: 'Paid as lost', learner: learnerName(item.learnerNumber), learnerNo: item.learnerNumber, invoiceNo: item.invoiceNo || '', amount: '', reference: item.paymentNo || '' });
+  });
+  db.invoices.forEach(invoice => invoice.items.filter(item => key(item.bookId) === key(bookId)).forEach(item => history.push({ date: invoice.createdAt || '', event: 'Invoice charge', learner: learnerName(invoice.learnerNumber), learnerNo: invoice.learnerNumber, invoiceNo: invoice.invoiceNo, amount: item.amount, reference: invoice.invoiceNo })));
+  db.payments.filter(item => key(item.bookId) === key(bookId)).forEach(item => history.push({ date: item.createdAt || '', event: 'Payment', learner: learnerName(item.learnerNumber), learnerNo: item.learnerNumber, invoiceNo: item.invoiceNo, amount: item.amount, reference: item.reference || item.paymentNo }));
+  (db.adjustments || []).filter(item => key(item.bookId) === key(bookId)).forEach(item => history.push({ date: item.createdAt || '', event: 'Return credit', learner: learnerName(item.learnerNumber), learnerNo: item.learnerNumber, invoiceNo: item.invoiceNo, amount: item.amount, reference: item.reference || item.adjustmentId }));
+  db.audit.filter(item => key(item.bookId) === key(bookId)).forEach(item => history.push({ date: item.timestamp || '', event: 'Audit · ' + item.action, learner: learnerName(item.learnerNo || item.learnerNumber), learnerNo: item.learnerNo || item.learnerNumber || '', invoiceNo: '', amount: '', reference: item.reference || '', details: item.notes || `${item.previousState || ''} → ${item.newState || ''}` }));
+  history.sort((a, b) => String(a.date).localeCompare(String(b.date)) || String(a.event).localeCompare(String(b.event)));
+  $('bookHistoryDetail').innerHTML = `<div class="panel"><div class="actions"><button onclick="document.getElementById('bookHistoryDetail').innerHTML=''">Close book history</button></div><h2>${esc(catalogue.title || bookTitle(bookId))}</h2><p><b>Book code:</b> ${esc(bookId)} · <b>Grade:</b> ${esc(catalogue.grade || catalogue.Grade || '—')} · <b>Subject:</b> ${esc(catalogue.subject || '')}<br><b>ISBN:</b> ${esc(catalogue.isbn || catalogue.ISBN || '—')} · <b>Publisher:</b> ${esc(catalogue.publisher || catalogue.Publisher || '—')} · <b>Replacement price:</b> ${money(catalogue.replacementPrice || catalogue.OriginalPrice_ZAR || 0)}</p>${table(['Date', 'Event', 'Learner', 'Invoice', 'Amount', 'Reference', 'Details'], history.map(item => `<tr><td>${esc(String(item.date || '').replace('T', ' ').slice(0, 16))}</td><td>${esc(item.event)}</td><td>${item.learnerNo ? `<button class="small" onclick="openLearnerFromRecords('${encodeURIComponent(item.learnerNo)}')">${esc(item.learner)}</button>` : esc(item.learner)}</td><td>${item.invoiceNo ? `<button class="small" onclick="openInvoiceFromRecords('${encodeURIComponent(item.invoiceNo)}')">${esc(item.invoiceNo)}</button>` : ''}</td><td class="money">${item.amount === '' ? '' : money(item.amount)}</td><td>${esc(item.reference)}</td><td>${esc(item.details || '')}</td></tr>`))}</div>`;
+  $('bookHistoryDetail').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function switchTab(tab) {
+  if (managedLearnerNo && tab !== 'learners') return;
+  document.querySelectorAll('.view').forEach(view => view.classList.toggle('hidden', view.id !== tab));
+  document.querySelectorAll('#tabs .tab').forEach(button => button.classList.toggle('active', button.dataset.tab === tab));
+  if (tab === 'learners') renderLearners();
+  if (tab === 'inventory') renderInventory();
+  if (tab === 'catalogue') renderCatalogue();
+  if (tab === 'invoices') renderInvoices();
+  if (tab === 'bulk') renderBulk();
+  if (tab === 'audit') renderAudit();
+  if (tab === 'records') renderRecordsExplorer();
+}
+
+function prepareV3Client() {
+  const nav = $('tabs');
+  const button = document.createElement('button');
+  button.type = 'button'; button.className = 'tab'; button.dataset.tab = 'records'; button.textContent = 'Records Explorer';
+  button.addEventListener('click', () => switchTab('records'));
+  nav.insertBefore(button, nav.querySelector('.nav-more'));
+  $('bulkInvoice').textContent = 'Invoice unbilled lost books';
+  const invoiceHelp = $('bulkInvoice').parentElement.parentElement.querySelector('p.muted');
+  if (invoiceHelp) invoiceHelp.textContent = 'Only reported-lost books are charged. Still-held books remain listed until returned or reported lost; returned, paid, and already-invoiced books are skipped.';
+  $('markSelectedReturns').onclick = () => {
+    const grade = $('returnGrade').value, className = $('returnClass').value, bookId = $('returnBook').value;
+    const chosen = [...document.querySelectorAll('.bulkReturnLearnerCheck:checked')].map(input => input.value);
+    if (!grade || !className || !bookId) return alert('Choose a grade, class, and textbook first.');
+    if (!chosen.length) return alert('Select the learners who returned this textbook.');
+    const eligible = new Set(returnLearnersForBook(grade, className, bookId, db.learners, db.allocations).map(key));
+    const valid = chosen.filter(no => eligible.has(key(no)) && allocation(no, bookId) && !['Returned', 'Paid'].includes(allocation(no, bookId).status));
+    if (!valid.length) return alert('None of the selected learners has a returnable allocation for this textbook.');
+    if (!confirm(`Mark ${valid.length} learner(s) as returned for ${bookTitle(bookId)}?`)) return;
+    const completed = valid.filter(no => recordBookReturn(no, bookId, 'Book returned through grade/class/textbook batch'));
+    if (!completed.length) return alert('No selected return could be recorded.');
+    log('BOOK_RETURN_BATCH', '', bookId, '', 'Returned ' + completed.length, '', `Grade ${grade}; class ${className}`);
+    save(); renderBulkReturns();
+    $('returnBatchResult').innerHTML = `<div class="notice ok">Recorded ${completed.length} return(s) for ${esc(bookTitle(bookId))}. Any outstanding invoice charges were credited.</div>`;
+  };
+  const filterIds = ['recordsSearch', 'recordsType', 'recordsGrade', 'recordsClass', 'recordsStatus', 'recordsFrom', 'recordsTo', 'recordsSort', 'recordsDirection', 'recordsPageSize'];
+  filterIds.forEach(id => $(id).addEventListener(id === 'recordsSearch' || id === 'recordsFrom' || id === 'recordsTo' ? 'input' : 'change', () => { v3RecordsPage = 0; renderRecordsExplorer(); }));
+  $('recordsPrevious').addEventListener('click', () => { v3RecordsPage = Math.max(0, v3RecordsPage - 1); renderRecordsExplorer(); });
+  $('recordsNext').addEventListener('click', () => { v3RecordsPage += 1; renderRecordsExplorer(); });
+  $('recordsExport').addEventListener('click', () => {
+    const rows = filteredRecordRows().map(({ type, date, learner, learnerNumber, grade, className, bookId, invoiceNo, status, amount, reference, details }) => ({ Type: type, Date: date, Learner: learner, LearnerNumber: learnerNumber, Grade: grade, Class: className, BookCode: bookId, InvoiceNo: invoiceNo, Status: status, Amount: amount, Reference: reference, Details: details }));
+    csvDownload('Textbook_Records_Filtered.csv', rows);
+  });
+  $('exportInvoices').onclick = () => csvDownload('Invoices.csv', db.invoices.flatMap(invoice => invoice.items.map(item => {
+    const balance = lineBalance(invoice, item.bookId);
+    return { InvoiceNo: invoice.invoiceNo, LearnerNumber: invoice.learnerNumber, BookCode: item.bookId, Title: item.title || bookTitle(item.bookId), Charge: balance.charged, Paid: balance.paid, Credit: balance.credited, Due: balance.due, Status: balance.state, CreatedAt: invoice.createdAt };
+  })));
+  $('resetDemo').onclick = () => alert('The shared textbook records are stored in the school spreadsheet. Use the owner-only shared transaction reset after exporting a backup.');
+  v3RecordsListenersReady = true;
+}
+
+prepareV3Client();
+startApp();
+</script>
